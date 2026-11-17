@@ -371,9 +371,7 @@ impl ServerInviteDialog {
             return Ok(());
         }
 
-        let request =
-            self.inner
-                .make_request(crate::sip::Method::Bye, None, None, None, headers, None)?;
+        let request = || self.inner.make_request(crate::sip::Method::Bye, None, None, None, headers, None);
 
         self.inner.send_bye(request, TerminatedReason::UasBye).await
     }
@@ -434,10 +432,9 @@ impl ServerInviteDialog {
             body = ?body.as_deref().map(String::from_utf8_lossy),
             "sending re-invite request"
         );
-        let request =
-            self.inner
-                .make_request(crate::sip::Method::Invite, None, None, None, headers, body)?;
-        self.inner.do_request(request).await
+        self.inner
+            .do_request_with(|| self.inner.make_request(crate::sip::Method::Invite, None, None, None, headers, body))
+            .await
     }
 
     /// Send an UPDATE request to modify session parameters
@@ -481,10 +478,9 @@ impl ServerInviteDialog {
             body = ?body.as_deref().map(String::from_utf8_lossy),
             "sending update request"
         );
-        let request =
-            self.inner
-                .make_request(crate::sip::Method::Update, None, None, None, headers, body)?;
-        self.inner.do_request(request.clone()).await
+        self.inner
+            .do_request_with(|| self.inner.make_request(crate::sip::Method::Update, None, None, None, headers, body))
+            .await
     }
 
     /// Send an INFO request for mid-dialog information
@@ -532,10 +528,9 @@ impl ServerInviteDialog {
             body = ?body.as_deref().map(String::from_utf8_lossy),
             "sending info request"
         );
-        let request =
-            self.inner
-                .make_request(crate::sip::Method::Info, None, None, None, headers, body)?;
-        self.inner.do_request(request.clone()).await
+        self.inner
+            .do_request_with(|| self.inner.make_request(crate::sip::Method::Info, None, None, None, headers, body))
+            .await
     }
 
     /// Send a generic in-dialog request
@@ -549,10 +544,9 @@ impl ServerInviteDialog {
             return Ok(None);
         }
         debug!(id = %self.id(), %method, "sending request");
-        let request = self
-            .inner
-            .make_request(method, None, None, None, headers, body)?;
-        self.inner.do_request(request).await
+        self.inner
+            .do_request_with(|| self.inner.make_request(method, None, None, None, headers, body))
+            .await
     }
 
     /// Send a NOTIFY request

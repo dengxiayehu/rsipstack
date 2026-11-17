@@ -22,6 +22,7 @@ use crate::transaction::key::TransactionRole;
 use crate::transaction::transaction::{Transaction, TransactionEvent};
 use crate::Result;
 use core::sync::atomic::Ordering;
+use futures::stream::{FuturesUnordered, StreamExt};
 use tracing::{debug, info, trace, warn};
 
 /// Jittered glare backoff: 2.1–4.0 s (RFC 3261 §14.1 wants random spacing).
@@ -476,10 +477,9 @@ impl InviteDialog {
             self.inner.update_remote_tag(tag.value())?;
         }
         self.update_remote_target_from_2xx(resp)?;
-        let request = self
-            .inner
-            .make_request(Method::Bye, None, None, None, None, None)?;
-        self.inner.do_request(request).await?;
+        self.inner
+            .do_request_with(|| self.inner.make_request(Method::Bye, None, None, None, None, None))
+            .await?;
         Ok(())
     }
 
@@ -492,34 +492,24 @@ impl InviteDialog {
     /// session — terminates it with a BYE. Everything else (retransmitted
     /// 2xx with the same tag, non-2xx) is ignored. `seen` holds the forked
     /// tags already BYE'd, so a retransmitted forked 2xx sends one BYE only.
-    pub(super) async fn end_forked_branch(
+    fn end_forked_branch(
         &self,
         msg: &SipMessage,
         confirmed_remote_tag: &str,
         seen: &mut Vec<String>,
-    ) {
+    ) -> Option<impl core::future::Future<Output = ()> + Send + 'static> {
         let SipMessage::Response(resp) = msg else {
-            return;
+            return None;
         };
         if resp.status_code.kind() != StatusCodeKind::Successful {
-            return;
+            return None;
         }
-        // Same tag: a retransmission of the confirmed 2xx, already re-ACKed.
-        let tag = match resp
-            .to_header()
-            .ok()
-            .and_then(|to| to.tag().ok().flatten())
-            .map(|tag| tag.value().to_string())
-        {
-            Some(tag) => tag,
-            None => return,
-        };
-        if tag == confirmed_remote_tag {
-            return;
+        let tag = resp.to_header().ok()?.tag().ok()??.value().to_string();
+        if tag == confirmed_remote_tag || seen.iter().any(|seen| seen == &tag) {
+            return None;
         }
-        if seen.iter().any(|seen| seen == &tag) {
-            return;
-        }
+        // The transaction fixes Call-ID/local tag; each distinct remote tag
+        // identifies one fork. Reserve it before polling any cleanup future.
         seen.push(tag.clone());
         let id = self.id();
         info!(
@@ -527,9 +517,42 @@ impl InviteDialog {
             tag = %tag,
             "forked 2xx acknowledged; ending the extra branch with a BYE (RFC 3261 §13.2.2.4)"
         );
-        if let Err(e) = self.inner.bye_forked_branch(resp).await {
-            warn!(id = %id, tag = %tag, error = %e, "failed to BYE the forked branch");
+        let dialog = self.clone();
+        let response = resp.clone();
+        Some(async move {
+            if let Err(e) = dialog.inner.bye_forked_branch(&response).await {
+                warn!(id = %id, tag = %tag, error = %e, "failed to BYE the forked branch");
+            }
+        })
+    }
+
+    /// One owner drives the Accepted INVITE and its independent fork BYEs.
+    /// Retain receive() across cleanup completions: cancelling a partially
+    /// polled receive could interrupt its ACK send. Dropping this owner drops
+    /// every pending cleanup; normal completion drains them using their own
+    /// transaction deadlines, without a second timeout or detached tasks.
+    pub(super) async fn drain_accepted(&self, mut tx: Transaction, confirmed_tag: &str) {
+        let mut seen = Vec::new();
+        let mut cleanups = FuturesUnordered::new();
+        loop {
+            let message = {
+                let mut received = core::pin::pin!(tx.receive());
+                loop {
+                    if cleanups.is_empty() {
+                        break received.await;
+                    }
+                    match crate::platform::select2(cleanups.next(), &mut received).await {
+                        crate::platform::Either::A(_) => {}
+                        crate::platform::Either::B(message) => break message,
+                    }
+                }
+            };
+            let Some(message) = message else { break };
+            if let Some(cleanup) = self.end_forked_branch(&message, confirmed_tag, &mut seen) {
+                cleanups.push(cleanup);
+            }
         }
+        while cleanups.next().await.is_some() {}
     }
 
     // ── Shared request semantics ──────────────────────────────────────────
@@ -571,9 +594,7 @@ impl InviteDialog {
             return Ok(());
         }
 
-        let request = self
-            .inner
-            .make_request(Method::Bye, None, None, None, headers, None)?;
+        let request = || self.inner.make_request(Method::Bye, None, None, None, headers, None);
 
         let reason = match self.role() {
             TransactionRole::Server => TerminatedReason::UasBye,
@@ -602,10 +623,9 @@ impl InviteDialog {
             body = ?body.as_deref().map(String::from_utf8_lossy),
             "sending re-invite request"
         );
-        let request = self
-            .inner
-            .make_request(Method::Invite, None, None, None, headers, body)?;
-        self.inner.do_request(request).await
+        self.inner
+            .do_request_with(|| self.inner.make_request(Method::Invite, None, None, None, headers, body))
+            .await
     }
 
     /// re-INVITE with glare handling (RFC 3261 §14.1): on 491 retry after a
@@ -658,10 +678,9 @@ impl InviteDialog {
             body = ?body.as_deref().map(String::from_utf8_lossy),
             "sending update request"
         );
-        let request = self
-            .inner
-            .make_request(Method::Update, None, None, None, headers, body)?;
-        self.inner.do_request(request.clone()).await
+        self.inner
+            .do_request_with(|| self.inner.make_request(Method::Update, None, None, None, headers, body))
+            .await
     }
 
     /// Send an INFO request for mid-dialog information.
@@ -678,10 +697,9 @@ impl InviteDialog {
             body = ?body.as_deref().map(String::from_utf8_lossy),
             "sending info request"
         );
-        let request = self
-            .inner
-            .make_request(Method::Info, None, None, None, headers, body)?;
-        self.inner.do_request(request.clone()).await
+        self.inner
+            .do_request_with(|| self.inner.make_request(Method::Info, None, None, None, headers, body))
+            .await
     }
 
     /// Send a generic in-dialog request.
@@ -695,10 +713,9 @@ impl InviteDialog {
             return Ok(None);
         }
         debug!(id = %self.id(), %method, "sending request");
-        let request = self
-            .inner
-            .make_request(method, None, None, None, headers, body)?;
-        self.inner.do_request(request).await
+        self.inner
+            .do_request_with(|| self.inner.make_request(method, None, None, None, headers, body))
+            .await
     }
 
     /// Send a NOTIFY request.

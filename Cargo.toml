@@ -1,10 +1,10 @@
 [package]
-name = "rsipstack"
+name = "fork-rsipstack"
 version = "0.7.14"
 edition = "2021"
-description = "SIP Stack Rust library for building SIP applications"
+description = "rsipstack 0.7.14 fork with ordered dialog sends and nonblocking fork cleanup"
 license = "MIT"
-repository = "https://github.com/restsend/rsipstack"
+repository = "https://github.com/dengxiayehu/rsipstack"
 readme = "README.md"
 keywords = ["sip", "voip", "telephony", "sipstack"]
 authors = ["jinti<shenjindi@fourz.cn>"]
@@ -20,6 +20,7 @@ exclude = [
 
 
 [lib]
+name = "rsipstack"
 # rlib only: the FFI boundary lives in downstream integrators (rtcembed).
 # A `cdylib` build of a no_std crate would demand a `#[global_allocator]` +
 # `#[panic_handler]` from this crate, which belongs to the firmware instead.

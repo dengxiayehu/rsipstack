@@ -88,10 +88,9 @@ impl ClientPublicationDialog {
         headers: Option<Vec<crate::sip::Header>>,
         body: Option<Vec<u8>>,
     ) -> Result<Option<crate::sip::Response>> {
-        let request = self
-            .inner
-            .make_request(method, None, None, None, headers, body)?;
-        self.inner.do_request(request).await
+        self.inner
+            .do_request_with(|| self.inner.make_request(method, None, None, None, headers, body))
+            .await
     }
 
     pub async fn refer(
@@ -216,10 +215,9 @@ impl ServerPublicationDialog {
         if !self.inner.is_confirmed() {
             return Ok(None);
         }
-        let request = self
-            .inner
-            .make_request(method, None, None, None, headers, body)?;
-        self.inner.do_request(request).await
+        self.inner
+            .do_request_with(|| self.inner.make_request(method, None, None, None, headers, body))
+            .await
     }
 
     pub async fn refer(

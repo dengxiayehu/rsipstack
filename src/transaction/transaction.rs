@@ -184,6 +184,8 @@ pub struct Transaction {
     pub timer_l: Option<u64>, // server invite only (Accepted-state 64*T1 per RFC 6026 §7.1)
     pub timer_m: Option<u64>, // client invite only (Accepted-state 64*T1 per RFC 6026 §7.2)
     retransmission: bool,
+    // Calling may precede the first successful transport write.
+    request_sent: bool,
     is_cleaned_up: bool,
 }
 
@@ -222,6 +224,7 @@ impl Transaction {
             timer_k: None,
             timer_g: None,
             retransmission: true,
+            request_sent: false,
             timer_l: None,
             timer_m: None,
             tu_receiver,
@@ -327,9 +330,12 @@ impl Transaction {
         // timers (Timer A / Timer B) handle retries and timeouts.
         let mut stream_failed = false;
         if let Some(connection) = self.connection.as_ref() {
-            if let Err(e) = connection.send(message, self.destination.as_ref()).await {
-                warn!(key = %self.key, error = %e, "send failed");
-                stream_failed = connection.is_stream();
+            match connection.send(message, self.destination.as_ref()).await {
+                Ok(()) => self.request_sent = true,
+                Err(e) => {
+                    warn!(key = %self.key, error = %e, "send failed");
+                    stream_failed = connection.is_stream();
+                }
             }
         } else {
             debug!(key = %self.key, "no connection, will retry on timer");
@@ -797,7 +803,25 @@ impl Transaction {
     /// dedicated cancellation channel that the transaction itself
     /// observes via `TransactionEvent::Terminate`.
     pub async fn receive(&mut self) -> Option<SipMessage> {
-        while let Some(event) = self.tu_receiver.recv().await {
+        self.receive_with_send_callback(|| {}).await
+    }
+
+    /// Notify the dialog after the first successful write, including timer retries,
+    /// before waiting for a response. The existing transaction timers remain in charge.
+    pub(crate) async fn receive_with_send_callback(
+        &mut self,
+        on_sent: impl FnOnce() + Send,
+    ) -> Option<SipMessage> {
+        let mut on_sent = Some(on_sent);
+        loop {
+            if self.request_sent {
+                if let Some(on_sent) = on_sent.take() {
+                    on_sent();
+                }
+            }
+            let Some(event) = self.tu_receiver.recv().await else {
+                return None;
+            };
             match event {
                 TransactionEvent::Received(msg, connection) => {
                     if let Some(msg) = match msg {
@@ -821,7 +845,6 @@ impl Transaction {
                 }
             }
         }
-        None
     }
 
     /// Stop request retransmissions while keeping the transaction alive to
@@ -1188,13 +1211,13 @@ impl Transaction {
                             } else {
                                 self.original.to_owned().into()
                             };
-                            if let Err(e) = connection
-                                .send(retry_message, self.destination.as_ref())
-                                .await
-                            {
-                                warn!(key = %self.key, error = %e, "timer A resend failed");
-                                if connection.is_stream() {
-                                    return self.on_stream_send_failure();
+                            match connection.send(retry_message, self.destination.as_ref()).await {
+                                Ok(()) => self.request_sent = true,
+                                Err(e) => {
+                                    warn!(key = %self.key, error = %e, "timer A resend failed");
+                                    if connection.is_stream() {
+                                        return self.on_stream_send_failure();
+                                    }
                                 }
                             }
                         } else {

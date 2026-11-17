@@ -13,7 +13,7 @@ const MARKER: &str = "private-marker";
 
 /// Records every event as (level, " field=value ...").
 #[derive(Clone, Default)]
-struct Capture(Arc<Mutex<Vec<(Level, String)>>>);
+pub(super) struct Capture(Arc<Mutex<Vec<(Level, String)>>>);
 
 impl Subscriber for Capture {
     fn enabled(&self, _: &Metadata<'_>) -> bool {
@@ -39,7 +39,7 @@ impl Subscriber for Capture {
 }
 
 impl Capture {
-    fn lines(&self, level: Level, needle: &str) -> Vec<String> {
+    pub(super) fn lines(&self, level: Level, needle: &str) -> Vec<String> {
         let records = self.0.lock().unwrap();
         let hits = records
             .iter()
@@ -111,7 +111,7 @@ async fn test_failed_request_send_warns_without_the_request() -> crate::Result<(
 
     // send_dialog_request, then send_prack_request.
     assert!(inner.do_request(request("INFO", 2)).await.is_err());
-    assert!(inner.send_prack_request(request("PRACK", 3)).await.is_err());
+    assert!(inner.send_prack_request(request("PRACK", 3), inner.outgoing.lock().await).await.is_err());
 
     let warns = capture.lines(Level::WARN, "failed to send request");
     assert_eq!(warns.len(), 2, "{warns:?}");

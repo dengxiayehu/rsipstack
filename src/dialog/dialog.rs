@@ -7,7 +7,7 @@ use super::{
 };
 use crate::platform::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use crate::platform::sync::Mutex;
-use crate::platform::CancellationToken;
+use crate::platform::{AsyncMutex, AsyncMutexGuard, CancellationToken};
 use crate::prelude::*;
 use crate::sip::{
     headers::typed::record_route::split_rr_values,
@@ -308,6 +308,8 @@ pub struct DialogInner {
     pub state: Mutex<DialogState>,
 
     pub local_seq: AtomicU32,
+    // CSeq allocation and the initial transport write form one ordered operation.
+    pub(super) outgoing: AsyncMutex<()>,
     pub local_contact: Option<crate::sip::Uri>,
     pub remote_contact: Mutex<Option<crate::sip::headers::untyped::Contact>>,
 
@@ -488,6 +490,7 @@ impl DialogInner {
             from,
             to: Mutex::new(to),
             local_seq: AtomicU32::new(cseq),
+            outgoing: AsyncMutex::new(()),
             remote_uri: Mutex::new(remote_uri),
             remote_seq: AtomicU32::new(0),
             credential,
@@ -673,14 +676,19 @@ impl DialogInner {
             self.update_remote_tag(tag.value())?;
         }
 
+        let send_guard = self.outgoing.lock().await;
         if let Some(prack) = self.prepare_prack_request(resp)? {
-            let _ = self.send_prack_request(prack).await?;
+            let _ = self.send_prack_request(prack, send_guard).await?;
         }
 
         Ok(())
     }
 
-    pub(super) async fn send_prack_request(&self, request: Request) -> Result<Option<Response>> {
+    pub(super) async fn send_prack_request(
+        &self,
+        request: Request,
+        send_guard: AsyncMutexGuard<'_, ()>,
+    ) -> Result<Option<Response>> {
         let method = request.method().to_owned();
         let key = TransactionKey::from_request(&request, TransactionRole::Client)?;
         // RFC 5626 flow affinity: reuse the reliable connection recorded for
@@ -722,8 +730,14 @@ impl DialogInner {
             }
         }
 
+        let mut send_guard = Some(send_guard);
         let mut auth = AuthRetry::new();
-        while let Some(msg) = tx.receive().await {
+        while let Some(msg) = tx
+            .receive_with_send_callback(|| drop(send_guard.take()))
+            .await
+        {
+            // A local transport error/timeout also ends the initial submission.
+            drop(send_guard.take());
             match msg {
                 SipMessage::Response(resp) => match resp.status_code {
                     StatusCode::Trying => continue,
@@ -741,6 +755,7 @@ impl DialogInner {
                             break;
                         }
                         if let Some(cred) = &self.credential {
+                            send_guard = Some(self.outgoing.lock().await);
                             let new_seq = self.increment_local_seq();
                             tx = handle_client_authenticate(new_seq, &tx, resp, cred).await?;
                             tx.send().await?;
@@ -1138,7 +1153,12 @@ impl DialogInner {
         })
     }
 
-    async fn send_dialog_request(&self, request: Request) -> Result<Option<Response>> {
+    async fn send_dialog_request(
+        &self,
+        make_request: impl FnOnce() -> Result<Request> + Send,
+        mut send_guard: Option<AsyncMutexGuard<'_, ()>>,
+    ) -> Result<Option<Response>> {
+        let request = make_request()?;
         let method = request.method().to_owned();
         let key = TransactionKey::from_request(&request, TransactionRole::Client)?;
         // RFC 5626 flow affinity: deliver in-dialog requests to the remote
@@ -1272,8 +1292,14 @@ impl DialogInner {
             }
         }
 
+        // Hold the sender gate through a deferred first write, but not its response.
         let mut auth = AuthRetry::new();
-        while let Some(msg) = tx.receive().await {
+        while let Some(msg) = tx
+            .receive_with_send_callback(|| drop(send_guard.take()))
+            .await
+        {
+            // A local transport error/timeout also ends the initial submission.
+            drop(send_guard.take());
             match msg {
                 SipMessage::Response(resp) => {
                     // RFC 7989 §8: accept the peer's (possibly new) UUID from
@@ -1324,6 +1350,11 @@ impl DialogInner {
                             break;
                         }
                         if let Some(cred) = &self.credential {
+                            send_guard = if method == Method::Cancel {
+                                None
+                            } else {
+                                Some(self.outgoing.lock().await)
+                            };
                             let new_seq = match method {
                                 crate::sip::Method::Cancel => self.get_local_seq(),
                                 _ => self.increment_local_seq(),
@@ -1361,15 +1392,34 @@ impl DialogInner {
     }
 
     pub(super) async fn do_request(&self, request: Request) -> Result<Option<Response>> {
-        self.send_dialog_request(request).boxed().await
+        if request.method == Method::Cancel {
+            // CANCEL reuses the INVITE CSeq and must not wait behind a PRACK retry.
+            self.send_dialog_request(|| Ok(request), None).boxed().await
+        } else {
+            self.do_request_with(|| Ok(request)).await
+        }
+    }
+
+    pub(super) async fn do_request_with(
+        &self,
+        make_request: impl FnOnce() -> Result<Request> + Send,
+    ) -> Result<Option<Response>> {
+        let send_guard = self.outgoing.lock().await;
+        self.send_dialog_request(make_request, Some(send_guard))
+            .boxed()
+            .await
     }
 
     /// Send the BYE that ends this dialog. RFC 3261 §15.1.1: the session ends
     /// once the BYE is handed to its transaction, and a 481, a 408 or no
     /// response ends the dialog. So whatever the transaction returns, the
     /// dialog is `Terminated(reason)`; a failure is still returned.
-    pub(super) async fn send_bye(&self, request: Request, reason: TerminatedReason) -> Result<()> {
-        let result = self.do_request(request).await;
+    pub(super) async fn send_bye(
+        &self,
+        make_request: impl FnOnce() -> Result<Request> + Send,
+        reason: TerminatedReason,
+    ) -> Result<()> {
+        let result = self.do_request_with(make_request).await;
         let id = self.id.lock().clone();
         self.transition(DialogState::Terminated(id, reason));
         result.map(|_| ())
@@ -1449,18 +1499,15 @@ impl DialogInner {
         }
         let id = self.id.lock().clone();
         warn!(%id, "no ACK for the 2xx within 64*T1, ending the session");
-        let bye = self.make_request(Method::Bye, None, None, None, None, None);
         self.transition(DialogState::Terminated(
             id.clone(),
             TerminatedReason::Timeout,
         ));
-        match bye {
-            Ok(bye) => {
-                if let Err(e) = self.do_request(bye).await {
-                    warn!(%id, error = %e, "BYE after missing ACK failed");
-                }
-            }
-            Err(e) => warn!(%id, error = %e, "failed to build BYE after missing ACK"),
+        if let Err(e) = self
+            .do_request_with(|| self.make_request(Method::Bye, None, None, None, None, None))
+            .await
+        {
+            warn!(%id, error = %e, "BYE after missing ACK failed");
         }
     }
 
@@ -1571,6 +1618,7 @@ impl DialogInner {
             )),
 
             local_seq: AtomicU32::new(snapshot.local_cseq),
+            outgoing: AsyncMutex::new(()),
             remote_seq: AtomicU32::new(snapshot.remote_cseq),
 
             local_contact: snapshot.local_contact,

@@ -1,3 +1,24 @@
+# fork-rsipstack
+
+A fork of [restsend/rsipstack](https://github.com/restsend/rsipstack), based on
+upstream 0.7.14 (`feb80e8e4dea6a13769a4a5d704af47bcb7370a4`).
+The Cargo package is `fork-rsipstack`; the Rust library name remains `rsipstack`.
+
+```toml
+rsipstack = { package = "fork-rsipstack", version = "=0.7.14" }
+```
+
+This release keeps the upstream API and features, with fixes for:
+
+- Ordering dialog CSeq allocation through the first successful transport write,
+  including deferred retries, PRACK, authentication and missing-ACK BYE.
+- Releasing sender ownership on timeout or cancellation, while allowing CANCEL
+  to reuse its INVITE sequence without waiting for a deferred PRACK.
+- Continuing to receive and acknowledge forked/retransmitted successful INVITE
+  responses while independent branch BYE transactions are pending.
+
+The original upstream documentation follows.
+
 # rsipstack - A SIP Stack written in Rust
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/restsend/rsipstack)

@@ -129,6 +129,21 @@ async fn create_endpoint_without_transports(
 async fn create_endpoint_with_inspector(
     inspector: Option<Box<dyn crate::transaction::endpoint::MessageInspector>>,
 ) -> crate::Result<crate::transaction::endpoint::Endpoint> {
+    create_endpoint_with_locator(inspector, None).await
+}
+
+async fn create_endpoint_with_locator(
+    inspector: Option<Box<dyn crate::transaction::endpoint::MessageInspector>>,
+    locator: Option<Box<dyn crate::transaction::endpoint::TargetLocator>>,
+) -> crate::Result<crate::transaction::endpoint::Endpoint> {
+    create_endpoint_with_locator_and_options(inspector, locator, Default::default()).await
+}
+
+async fn create_endpoint_with_locator_and_options(
+    inspector: Option<Box<dyn crate::transaction::endpoint::MessageInspector>>,
+    locator: Option<Box<dyn crate::transaction::endpoint::TargetLocator>>,
+    options: crate::transaction::endpoint::EndpointOption,
+) -> crate::Result<crate::transaction::endpoint::Endpoint> {
     let token = CancellationToken::new();
     let tl = TransportLayer::new(token.child_token());
 
@@ -161,9 +176,13 @@ async fn create_endpoint_with_inspector(
     let mut builder = EndpointBuilder::new();
     builder
         .with_user_agent("rsipstack-affinity-test")
-        .with_transport_layer(tl);
+        .with_transport_layer(tl)
+        .with_option(options);
     if let Some(inspector) = inspector {
         builder.with_inspector(inspector);
+    }
+    if let Some(locator) = locator {
+        builder.with_target_locator(locator);
     }
     Ok(builder.build())
 }
@@ -768,4 +787,465 @@ async fn test_bye_before_send_reports_flow_destination() {
         Some(flow.addr),
         "before_send must carry the affinity flow's real remote address"
     );
+}
+
+
+/// Keep CSeq allocation and initial transport submission ordered. Maintained by elliottAI.
+#[tokio::test]
+async fn test_in_dialog_cseq_follows_transport_order_without_waiting_for_responses() {
+    use crate::transaction::endpoint::TargetLocator;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct GatedLocator {
+        calls: Arc<AtomicUsize>,
+        release: Arc<tokio::sync::Notify>,
+        address: SipAddr,
+    }
+
+    #[async_trait::async_trait]
+    impl TargetLocator for GatedLocator {
+        async fn locate(&self, _uri: &crate::sip::Uri) -> crate::Result<SipAddr> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.release.notified().await;
+            }
+            Ok(self.address.clone())
+        }
+    }
+
+    for automatic_bye in [false, true] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let address = wss_flow_addr(38091);
+        let endpoint = create_endpoint_with_locator(
+            None,
+            Some(Box::new(GatedLocator {
+                calls: calls.clone(),
+                release: release.clone(),
+                address: address.clone(),
+            })),
+        )
+        .await
+        .unwrap();
+        let endpoint_inner = endpoint.inner.clone();
+        let endpoint_task = tokio::spawn(async move { endpoint_inner.serve().await });
+        let mut flow = create_wss_flow(&endpoint.inner, address).await;
+        let mut invite =
+            create_wss_invite_request("sender", "receiver", "ordered-dialog", "z9hG4bK-order");
+        invite.headers.unique_push(CSeq::new("23 INVITE").into());
+        let inner = Arc::new(server_dialog(
+            endpoint.inner.clone(),
+            TransactionRole::Server,
+            invite.clone(),
+            "sip:sender@example.com",
+        ));
+        inner.transition(DialogState::Confirmed(
+            inner.id.lock().clone(),
+            Response::default(),
+        ));
+        let dialog = InviteDialog::from_inner(inner);
+        let mut bye = Box::pin(async {
+            if automatic_bye {
+                dialog.info(None, None).await.map(|_| ())
+            } else {
+                dialog.bye().await
+            }
+        });
+        assert!(futures::poll!(bye.as_mut()).is_pending());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let mut info = Box::pin(dialog.info(None, None));
+        assert!(futures::poll!(info.as_mut()).is_pending());
+        let key = TransactionKey::from_request(&invite, TransactionRole::Server).unwrap();
+        let mut expired = Transaction::new_server(key, invite, endpoint.inner.clone(), None);
+        expired.state = crate::transaction::TransactionState::Terminated;
+        let mut timeout_bye = Box::pin(async {
+            if automatic_bye {
+                dialog.inner.end_session_without_ack(&expired, true).await;
+            }
+        });
+        if automatic_bye {
+            assert!(futures::poll!(timeout_bye.as_mut()).is_pending());
+        }
+        release.notify_one();
+        assert!(futures::poll!(bye.as_mut()).is_pending());
+        assert!(futures::poll!(info.as_mut()).is_pending());
+
+        // No response has been injected. Both requests must already be on the wire.
+        let mut requests = Vec::new();
+        for _ in 0..if automatic_bye { 3 } else { 2 } {
+            if automatic_bye {
+                let _ = futures::poll!(timeout_bye.as_mut());
+            }
+            let event = tokio::time::timeout(Duration::from_secs(2), flow.wire_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match event {
+                TransportEvent::Incoming(SipMessage::Request(request), _, _) => {
+                    requests.push(request)
+                }
+                event => panic!("unexpected wire event: {event:?}"),
+            }
+        }
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.method)
+                .collect::<Vec<_>>(),
+            if automatic_bye {
+                vec![Method::Info, Method::Info, Method::Bye]
+            } else {
+                vec![Method::Bye, Method::Info]
+            }
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.cseq_header().unwrap().seq().unwrap())
+                .collect::<Vec<_>>(),
+            if automatic_bye {
+                vec![24, 25, 26]
+            } else {
+                vec![24, 25]
+            }
+        );
+        for request in requests {
+            let response = Response {
+                status_code: StatusCode::OK,
+                wire_reason: None,
+                version: Version::V2,
+                headers: vec![
+                    request.via_header().unwrap().clone().into(),
+                    request.from_header().unwrap().clone().into(),
+                    request.to_header().unwrap().clone().into(),
+                    request.call_id_header().unwrap().clone().into(),
+                    request.cseq_header().unwrap().clone().into(),
+                    crate::sip::headers::ContentLength::from(0u32).into(),
+                ]
+                .into(),
+                body: Vec::new(),
+            };
+            flow.in_tx
+                .send(TransportEvent::Incoming(
+                    response.into(),
+                    flow.sip_conn.clone(),
+                    flow.addr.clone(),
+                ))
+                .unwrap();
+        }
+        let (bye_result, info_result) = tokio::time::timeout(Duration::from_secs(2), async {
+            let (bye, info, _) = tokio::join!(bye, info, timeout_bye);
+            (bye, info)
+        })
+        .await
+        .unwrap();
+        bye_result.unwrap();
+        assert_eq!(info_result.unwrap().unwrap().status_code, StatusCode::OK);
+        endpoint_task.abort();
+    }
+}
+
+/// Keep CSeq allocation and initial transport submission ordered. Maintained by elliottAI.
+#[tokio::test]
+async fn test_missing_ack_bye_preserves_queued_cseq() {
+    use crate::transaction::endpoint::TargetLocator;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct GatedLocator {
+        calls: Arc<AtomicUsize>,
+        release: Arc<tokio::sync::Notify>,
+        address: SipAddr,
+    }
+
+    #[async_trait::async_trait]
+    impl TargetLocator for GatedLocator {
+        async fn locate(&self, _uri: &crate::sip::Uri) -> crate::Result<SipAddr> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.release.notified().await;
+            }
+            Ok(self.address.clone())
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let address = wss_flow_addr(38091);
+    let endpoint = create_endpoint_with_locator(
+        None,
+        Some(Box::new(GatedLocator {
+            calls: calls.clone(),
+            release: release.clone(),
+            address: address.clone(),
+        })),
+    )
+    .await
+    .unwrap();
+    let endpoint_inner = endpoint.inner.clone();
+    let endpoint_task = tokio::spawn(async move { endpoint_inner.serve().await });
+    let mut flow = create_wss_flow(&endpoint.inner, address).await;
+    let mut invite =
+        create_wss_invite_request("sender", "receiver", "ordered-dialog", "z9hG4bK-order");
+    invite.headers.unique_push(CSeq::new("23 INVITE").into());
+    let inner = Arc::new(server_dialog(
+        endpoint.inner.clone(),
+        TransactionRole::Server,
+        invite,
+        "sip:sender@example.com",
+    ));
+    inner.transition(DialogState::Confirmed(
+        inner.id.lock().clone(),
+        Response::default(),
+    ));
+    let dialog = InviteDialog::from_inner(inner.clone());
+    let mut first = Box::pin(dialog.info(None, None));
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    let mut second = Box::pin(dialog.info(None, None));
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    let initial = inner.initial_request.lock().clone();
+    let key = TransactionKey::from_request(&initial, TransactionRole::Server).unwrap();
+    let mut expired = Transaction::new_server(key, initial, endpoint.inner.clone(), None);
+    expired.state = crate::transaction::TransactionState::Terminated;
+    let mut timeout_bye = Box::pin(inner.end_session_without_ack(&expired, true));
+    assert!(futures::poll!(timeout_bye.as_mut()).is_pending());
+    release.notify_one();
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    assert!(futures::poll!(timeout_bye.as_mut()).is_pending());
+    let mut actual = Vec::new();
+    for _ in 0..3 {
+        let event = tokio::time::timeout(Duration::from_secs(2), flow.wire_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let TransportEvent::Incoming(SipMessage::Request(request), _, _) = event else {
+            panic!("request");
+        };
+        actual.push((
+            request.method,
+            request.cseq_header().unwrap().seq().unwrap(),
+        ));
+    }
+    endpoint_task.abort();
+    assert!(
+        actual.windows(2).all(|pair| pair[0].1 < pair[1].1),
+        "wire CSeq must increase: {actual:?}"
+    );
+}
+
+/// Keep CSeq allocation and initial transport submission ordered. Maintained by elliottAI.
+#[tokio::test]
+async fn test_initial_send_retry_preserves_cseq() {
+    initial_send_retry_case(false).await;
+}
+
+#[tokio::test]
+async fn test_cancel_bypasses_deferred_prack() {
+    initial_send_retry_case(true).await;
+}
+
+async fn initial_send_retry_case(cancel: bool) {
+    use crate::transaction::endpoint::TargetLocator;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct GatedLocator {
+        calls: Arc<AtomicUsize>,
+        address: SipAddr,
+    }
+
+    #[async_trait::async_trait]
+    impl TargetLocator for GatedLocator {
+        async fn locate(&self, _uri: &crate::sip::Uri) -> crate::Result<SipAddr> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(wss_flow_addr(0));
+            }
+            Ok(self.address.clone())
+        }
+    }
+
+    struct AttemptInspector(Arc<tokio::sync::Notify>);
+    impl crate::transaction::endpoint::MessageInspector for AttemptInspector {
+        fn after_received(&self, msg: SipMessage, _: Option<&SipAddr>) -> SipMessage {
+            msg
+        }
+        fn before_send(&self, msg: SipMessage, _: Option<&SipAddr>) -> SipMessage {
+            self.0.notify_one();
+            msg
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let address = wss_flow_addr(38091);
+    let endpoint = create_endpoint_with_locator(
+        Some(Box::new(AttemptInspector(release.clone()))),
+        Some(Box::new(GatedLocator {
+            calls: calls.clone(),
+            address: address.clone(),
+        })),
+    )
+    .await
+    .unwrap();
+    let endpoint_inner = endpoint.inner.clone();
+    let endpoint_task = tokio::spawn(async move { endpoint_inner.serve().await });
+    let mut flow = create_wss_flow(&endpoint.inner, address).await;
+    let mut invite =
+        create_wss_invite_request("sender", "receiver", "ordered-dialog", "z9hG4bK-order");
+    invite.headers.unique_push(CSeq::new("23 INVITE").into());
+    let inner = Arc::new(server_dialog(
+        endpoint.inner.clone(),
+        TransactionRole::Client,
+        invite,
+        "sip:sender@example.com",
+    ));
+    let state_id = inner.id.lock().clone();
+    inner.transition(if cancel {
+        DialogState::Early(state_id, Response::default())
+    } else {
+        DialogState::Confirmed(state_id, Response::default())
+    });
+    let dialog = InviteDialog::from_inner(inner.clone());
+    let first_dialog = dialog.clone();
+    let first = tokio::spawn(async move {
+        if cancel {
+            let mut response = inner.endpoint_inner.make_response(
+                &inner.initial_request.lock(),
+                StatusCode::SessionProgress,
+                None,
+            );
+            response
+                .headers
+                .push(crate::sip::headers::make_header("Require", "100rel".into()));
+            response
+                .headers
+                .push(crate::sip::headers::make_header("RSeq", "1".into()));
+            inner.transition(DialogState::Early(
+                inner.id.lock().clone(),
+                response.clone(),
+            ));
+            inner.handle_provisional_response(&response).await.unwrap();
+        } else {
+            first_dialog.info(None, None).await.unwrap();
+        }
+    });
+    release.notified().await;
+    let second_dialog = dialog.clone();
+    let second = tokio::spawn(async move {
+        if cancel {
+            second_dialog.cancel().await.unwrap();
+        } else {
+            second_dialog.info(None, None).await.unwrap();
+        }
+    });
+    let mut actual = Vec::new();
+    for index in 0..2 {
+        let deadline = if cancel && index == 0 {
+            Duration::from_millis(250) // CANCEL must not wait for PRACK's 500ms retry.
+        } else {
+            Duration::from_secs(3)
+        };
+        let event = tokio::time::timeout(deadline, flow.wire_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let TransportEvent::Incoming(SipMessage::Request(request), _, _) = event else {
+            panic!("request");
+        };
+        actual.push((
+            request.method,
+            request.cseq_header().unwrap().seq().unwrap(),
+        ));
+    }
+    first.abort();
+    second.abort();
+    endpoint_task.abort();
+    assert_eq!(
+        actual,
+        if cancel {
+            vec![(Method::Cancel, 23), (Method::PRack, 24)]
+        } else {
+            vec![(Method::Info, 24), (Method::Info, 25)]
+        },
+        "CANCEL reuses the INVITE CSeq and must bypass a deferred PRACK"
+    );
+}
+
+/// A failed first write must not hold the dialog gate beyond the transaction deadline.
+#[tokio::test]
+async fn test_initial_send_timeout_releases_sender() {
+    initial_send_failure_releases_sender(false).await;
+}
+
+#[tokio::test]
+async fn test_dropped_initial_send_releases_sender() {
+    initial_send_failure_releases_sender(true).await;
+}
+
+async fn initial_send_failure_releases_sender(drop_request: bool) {
+    use crate::transaction::endpoint::{EndpointOption, TargetLocator};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct RecoveringLocator(Arc<AtomicBool>);
+    #[async_trait::async_trait]
+    impl TargetLocator for RecoveringLocator {
+        async fn locate(&self, _: &crate::sip::Uri) -> crate::Result<SipAddr> {
+            Ok(wss_flow_addr(if self.0.load(Ordering::SeqCst) {
+                38093
+            } else {
+                0
+            }))
+        }
+    }
+    let recovered = Arc::new(AtomicBool::new(false));
+    let endpoint = create_endpoint_with_locator_and_options(
+        None,
+        Some(Box::new(RecoveringLocator(recovered.clone()))),
+        EndpointOption {
+            t1: Duration::from_millis(10),
+            t1x64: Duration::from_millis(80),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let endpoint_inner = endpoint.inner.clone();
+    let endpoint_task = tokio::spawn(async move { endpoint_inner.serve().await });
+    let mut flow = create_wss_flow(&endpoint.inner, wss_flow_addr(38093)).await;
+    let invite =
+        create_wss_invite_request("sender", "receiver", "timeout-dialog", "z9hG4bK-timeout");
+    let inner = Arc::new(server_dialog(
+        endpoint.inner.clone(),
+        TransactionRole::Client,
+        invite,
+        "sip:sender@example.com",
+    ));
+    inner.transition(DialogState::Confirmed(
+        inner.id.lock().clone(),
+        Response::default(),
+    ));
+    let dialog = InviteDialog::from_inner(inner);
+    let mut first = Box::pin(dialog.info(None, None));
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    let mut second = Box::pin(dialog.info(None, None));
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    if drop_request {
+        drop(first);
+    } else {
+        let response = tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status_code, StatusCode::RequestTimeout);
+    }
+    recovered.store(true, Ordering::SeqCst);
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    let event = tokio::time::timeout(Duration::from_secs(2), flow.wire_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let TransportEvent::Incoming(SipMessage::Request(request), _, _) = event else {
+        panic!("request");
+    };
+    assert_eq!(request.method, Method::Info);
+    assert_eq!(request.cseq_header().unwrap().seq().unwrap(), 2423);
+    endpoint_task.abort();
 }

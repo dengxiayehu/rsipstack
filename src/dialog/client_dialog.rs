@@ -177,9 +177,7 @@ impl ClientInviteDialog {
             return Ok(());
         }
 
-        let request =
-            self.inner
-                .make_request(crate::sip::Method::Bye, None, None, None, headers, None)?;
+        let request = || self.inner.make_request(crate::sip::Method::Bye, None, None, None, headers, None);
 
         self.inner.send_bye(request, TerminatedReason::UacBye).await
     }
@@ -314,10 +312,9 @@ impl ClientInviteDialog {
             body = ?body.as_deref().map(String::from_utf8_lossy),
             "sending re-invite request"
         );
-        let request =
-            self.inner
-                .make_request(crate::sip::Method::Invite, None, None, None, headers, body)?;
-        self.inner.do_request(request).await
+        self.inner
+            .do_request_with(|| self.inner.make_request(crate::sip::Method::Invite, None, None, None, headers, body))
+            .await
     }
 
     /// Send an UPDATE request to modify session parameters
@@ -361,10 +358,9 @@ impl ClientInviteDialog {
             body = ?body.as_deref().map(String::from_utf8_lossy),
             "sending update request"
         );
-        let request =
-            self.inner
-                .make_request(crate::sip::Method::Update, None, None, None, headers, body)?;
-        self.inner.do_request(request.clone()).await
+        self.inner
+            .do_request_with(|| self.inner.make_request(crate::sip::Method::Update, None, None, None, headers, body))
+            .await
     }
 
     /// Send an INFO request for mid-dialog information
@@ -412,10 +408,9 @@ impl ClientInviteDialog {
             body = ?body.as_deref().map(String::from_utf8_lossy),
             "sending info request"
         );
-        let request =
-            self.inner
-                .make_request(crate::sip::Method::Info, None, None, None, headers, body)?;
-        self.inner.do_request(request.clone()).await
+        self.inner
+            .do_request_with(|| self.inner.make_request(crate::sip::Method::Info, None, None, None, headers, body))
+            .await
     }
 
     pub async fn options(
@@ -431,15 +426,16 @@ impl ClientInviteDialog {
             body = ?body.as_deref().map(String::from_utf8_lossy),
             "sending option request"
         );
-        let request = self.inner.make_request(
+        self.inner
+            .do_request_with(|| self.inner.make_request(
             crate::sip::Method::Options,
             None,
             None,
             None,
             headers,
             body,
-        )?;
-        self.inner.do_request(request.clone()).await
+        ))
+            .await
     }
 
     /// Send a generic in-dialog request
@@ -456,10 +452,9 @@ impl ClientInviteDialog {
             return Ok(None);
         }
         debug!(id = %self.id(), %method, "sending request");
-        let request = self
-            .inner
-            .make_request(method, None, None, None, headers, body)?;
-        self.inner.do_request(request).await
+        self.inner
+            .do_request_with(|| self.inner.make_request(method, None, None, None, headers, body))
+            .await
     }
 
     /// Send a NOTIFY request

@@ -63,176 +63,248 @@ async fn reply_ok(
 /// confirmed dialog or registering the forked branch.
 #[tokio::test]
 async fn test_forked_2xx_is_byed_without_touching_the_confirmed_dialog() -> crate::Result<()> {
-    let token = CancellationToken::new();
-    let peer = UdpSocket::bind("127.0.0.1:0").await?;
-    let tl = TransportLayer::new(token.child_token());
-    let udp = UdpConnection::create_connection("127.0.0.1:0".parse()?, None, None).await?;
-    let uac_addr = udp.get_addr().get_socketaddr()?;
-    let contact = Uri::try_from(format!("sip:alice@{uac_addr}").as_str())?;
-    tl.add_transport(udp.into());
-    let endpoint = EndpointBuilder::new()
-        .with_transport_layer(tl)
-        .with_option(crate::transaction::endpoint::EndpointOption {
-            t1: Duration::from_millis(10),
-            t1x64: Duration::from_millis(640),
+    for asynchronous in [false, true] {
+        let capture = super::test_warn_logs::Capture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let token = CancellationToken::new();
+        let peer = UdpSocket::bind("127.0.0.1:0").await?;
+        let tl = TransportLayer::new(token.child_token());
+        let udp = UdpConnection::create_connection("127.0.0.1:0".parse()?, None, None).await?;
+        let uac_addr = udp.get_addr().get_socketaddr()?;
+        let contact = Uri::try_from(format!("sip:alice@{uac_addr}").as_str())?;
+        tl.add_transport(udp.into());
+        let endpoint = EndpointBuilder::new()
+            .with_transport_layer(tl)
+            .with_option(crate::transaction::endpoint::EndpointOption {
+                t1: Duration::from_millis(10),
+                t1x64: Duration::from_millis(640),
+                ..Default::default()
+            })
+            .build();
+        let inner = endpoint.inner.clone();
+        tokio::spawn(async move { inner.serve().await });
+
+        let layer = DialogLayer::new(endpoint.inner.clone());
+        let (state_sender, mut states) = unbounded_channel();
+        let invite = InviteOption {
+            caller: Uri::try_from("sip:alice@example.com")?,
+            callee: Uri::try_from(format!("sip:bob@{}", peer.local_addr()?).as_str())?,
+            contact,
             ..Default::default()
-        })
-        .build();
-    let inner = endpoint.inner.clone();
-    tokio::spawn(async move { inner.serve().await });
+        };
+        // A second handle over the same layer state, for the assertions below
+        // (DialogLayer is not Clone; the registry lives in the shared inner).
+        let assert_layer = DialogLayer {
+            endpoint: layer.endpoint.clone(),
+            inner: layer.inner.clone(),
+        };
+        let do_invite = if asynchronous {
+            let (dialog, task) =
+                std::sync::Arc::new(layer).do_invite_async(invite, state_sender)?;
+            tokio::spawn(async move {
+                let (_, response) = task.await.expect("invite task panicked")?;
+                Ok((dialog, response))
+            })
+        } else {
+            tokio::spawn(async move { layer.do_invite(invite, state_sender).await })
+        };
 
-    let layer = DialogLayer::new(endpoint.inner.clone());
-    let (state_sender, mut states) = unbounded_channel();
-    let invite = InviteOption {
-        caller: Uri::try_from("sip:alice@example.com")?,
-        callee: Uri::try_from(format!("sip:bob@{}", peer.local_addr()?).as_str())?,
-        contact,
-        ..Default::default()
-    };
-    // A second handle over the same layer state, for the assertions below
-    // (DialogLayer is not Clone; the registry lives in the shared inner).
-    let assert_layer = DialogLayer {
-        endpoint: layer.endpoint.clone(),
-        inner: layer.inner.clone(),
-    };
-    let do_invite = tokio::spawn(async move { layer.do_invite(invite, state_sender).await });
+        // The INVITE arrives; branch A answers with tag-a.
+        let mut buf = vec![0u8; 4096];
+        let (len, from) = tokio::time::timeout(Duration::from_secs(3), peer.recv_from(&mut buf))
+            .await
+            .expect("timeout waiting for the INVITE")?;
+        let invite_req = match SipMessage::try_from(&buf[..len])? {
+            SipMessage::Request(req) if req.method == Method::Invite => req,
+            other => panic!("expected the INVITE, got {other}"),
+        };
+        let ok_a = format!(
+            "SIP/2.0 200 OK\r\nVia: {}\r\nFrom: {}\r\nTo: {};tag=tag-a\r\nCall-ID: {}\r\nCSeq: {}\r\nContact: <sip:bob-a@{}>\r\nContent-Length: 0\r\n\r\n",
+            invite_req.via_header()?.value(),
+            invite_req.from_header()?.value(),
+            invite_req.to_header()?.value(),
+            invite_req.call_id_header()?.value(),
+            invite_req.cseq_header()?.value(),
+            peer.local_addr()?,
+        );
+        peer.send_to(ok_a.as_bytes(), from).await?;
 
-    // The INVITE arrives; branch A answers with tag-a.
-    let mut buf = vec![0u8; 4096];
-    let (len, from) = tokio::time::timeout(Duration::from_secs(3), peer.recv_from(&mut buf))
-        .await
-        .expect("timeout waiting for the INVITE")?;
-    let invite_req = match SipMessage::try_from(&buf[..len])? {
-        SipMessage::Request(req) if req.method == Method::Invite => req,
-        other => panic!("expected the INVITE, got {other}"),
-    };
-    let ok_a = format!(
-        "SIP/2.0 200 OK\r\nVia: {}\r\nFrom: {}\r\nTo: {};tag=tag-a\r\nCall-ID: {}\r\nCSeq: {}\r\nContact: <sip:bob-a@{}>\r\nContent-Length: 0\r\n\r\n",
-        invite_req.via_header()?.value(),
-        invite_req.from_header()?.value(),
-        invite_req.to_header()?.value(),
-        invite_req.call_id_header()?.value(),
-        invite_req.cseq_header()?.value(),
-        peer.local_addr()?,
-    );
-    peer.send_to(ok_a.as_bytes(), from).await?;
+        let (dialog, _) = tokio::time::timeout(Duration::from_secs(3), do_invite)
+            .await
+            .expect("timeout waiting for do_invite")
+            .expect("do_invite task panicked")?;
+        assert!(dialog.inner.state.lock().is_confirmed());
+        while states.try_recv().is_ok() {}
 
-    let (dialog, _) = tokio::time::timeout(Duration::from_secs(3), do_invite)
-        .await
-        .expect("timeout waiting for do_invite")
-        .expect("do_invite task panicked")?;
-    assert!(dialog.inner.state.lock().is_confirmed());
-    while states.try_recv().is_ok() {}
+        let confirmed = dialog.id();
+        assert_eq!(confirmed.remote_tag, "tag-a");
 
-    let confirmed = dialog.id();
-    assert_eq!(confirmed.remote_tag, "tag-a");
+        // Branch B forks in: same Call-ID, new To tag, own Contact.
+        let ok_b = format!(
+            "SIP/2.0 200 OK\r\nVia: {}\r\nFrom: {}\r\nTo: {};tag=tag-b\r\nCall-ID: {}\r\nCSeq: {}\r\nContact: <sip:bob-b@{}>\r\nContent-Length: 0\r\n\r\n",
+            invite_req.via_header()?.value(),
+            invite_req.from_header()?.value(),
+            invite_req.to_header()?.value(),
+            invite_req.call_id_header()?.value(),
+            invite_req.cseq_header()?.value(),
+            peer.local_addr()?,
+        );
+        peer.send_to(ok_b.as_bytes(), uac_addr).await?;
 
-    // Branch B forks in: same Call-ID, new To tag, own Contact.
-    let ok_b = format!(
-        "SIP/2.0 200 OK\r\nVia: {}\r\nFrom: {}\r\nTo: {};tag=tag-b\r\nCall-ID: {}\r\nCSeq: {}\r\nContact: <sip:bob-b@{}>\r\nContent-Length: 0\r\n\r\n",
-        invite_req.via_header()?.value(),
-        invite_req.from_header()?.value(),
-        invite_req.to_header()?.value(),
-        invite_req.call_id_header()?.value(),
-        invite_req.cseq_header()?.value(),
-        peer.local_addr()?,
-    );
-    peer.send_to(ok_b.as_bytes(), uac_addr).await?;
-
-    // The first ACK confirms branch A; the forked 2xx is then ACKed with
-    // its own tag and Contact as R-URI.
-    let (mut ack, _) = next_request(&peer, Method::Ack, "forked ACK").await;
-    while !ack
-        .to_header()
-        .ok()
-        .and_then(|to| to.tag().ok().flatten())
-        .is_some_and(|tag| tag.value() == "tag-b")
-    {
-        (ack, _) = next_request(&peer, Method::Ack, "forked ACK").await;
-    }
-    let ack_to = ack.to_header()?.value().to_string();
-    assert!(ack_to.contains(";tag=tag-b"), "ACK To: {ack_to}");
-    assert!(
-        ack.uri.to_string().contains("bob-b"),
-        "ACK R-URI must be the forked Contact: {}",
-        ack.uri
-    );
-
-    // The forked branch is then ended with a BYE from its own Contact.
-    let (bye, from) = next_request(&peer, Method::Bye, "forked-branch BYE").await;
-    let bye_to = bye.to_header()?.value().to_string();
-    assert!(bye_to.contains(";tag=tag-b"), "BYE To: {bye_to}");
-    assert!(
-        bye.uri.to_string().contains("bob-b"),
-        "BYE R-URI must be the forked Contact: {}",
-        bye.uri
-    );
-    let cseq = bye.cseq_header()?.value().to_string();
-    assert_eq!(cseq, "2 BYE", "BYE CSeq continues the forked dialog's");
-    assert_eq!(
-        bye.call_id_header()?.value(),
-        invite_req.call_id_header()?.value()
-    );
-    // The forked callee answers the BYE like a real UA would.
-    reply_ok(&peer, &bye, from).await?;
-
-    // A retransmission of the forked 2xx (in flight before its ACK landed)
-    // must not trigger a second BYE.
-    peer.send_to(ok_b.as_bytes(), uac_addr).await?;
-    let mut buf = vec![0u8; 4096];
-    let quiet_until = tokio::time::Instant::now() + Duration::from_millis(400);
-    loop {
-        let remaining = quiet_until.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
+        // The first ACK confirms branch A; the forked 2xx is then ACKed with
+        // its own tag and Contact as R-URI.
+        let (mut ack, _) = next_request(&peer, Method::Ack, "forked ACK").await;
+        while !ack
+            .to_header()
+            .ok()
+            .and_then(|to| to.tag().ok().flatten())
+            .is_some_and(|tag| tag.value() == "tag-b")
+        {
+            (ack, _) = next_request(&peer, Method::Ack, "forked ACK").await;
         }
-        match tokio::time::timeout(remaining, peer.recv_from(&mut buf)).await {
-            Err(_) => break, // the quiet window elapsed: no duplicate BYE
-            Ok(Err(e)) => return Err(e.into()),
-            Ok(Ok((len, _))) => {
-                if let Ok(SipMessage::Request(req)) = SipMessage::try_from(&buf[..len]) {
-                    assert_ne!(
-                        req.method,
-                        Method::Bye,
-                        "duplicate BYE for a retransmitted forked 2xx"
-                    );
+        let ack_to = ack.to_header()?.value().to_string();
+        assert!(ack_to.contains(";tag=tag-b"), "ACK To: {ack_to}");
+        assert!(
+            ack.uri.to_string().contains("bob-b"),
+            "ACK R-URI must be the forked Contact: {}",
+            ack.uri
+        );
+
+        // The forked branch is then ended with a BYE from its own Contact.
+        let (bye, from) = next_request(&peer, Method::Bye, "forked-branch BYE").await;
+        let bye_to = bye.to_header()?.value().to_string();
+        assert!(bye_to.contains(";tag=tag-b"), "BYE To: {bye_to}");
+        assert!(
+            bye.uri.to_string().contains("bob-b"),
+            "BYE R-URI must be the forked Contact: {}",
+            bye.uri
+        );
+        let cseq = bye.cseq_header()?.value().to_string();
+        assert_eq!(cseq, "2 BYE", "BYE CSeq continues the forked dialog's");
+        assert_eq!(
+            bye.call_id_header()?.value(),
+            invite_req.call_id_header()?.value()
+        );
+        // A silent fork must not stop ACKs for the selected branch. The initial
+        // ACK was consumed above, so only this injected retransmission can satisfy it.
+        peer.send_to(ok_b.as_bytes(), uac_addr).await?;
+        let (ack_b, _) = next_request(
+            &peer,
+            Method::Ack,
+            "fork retransmission while cleanup is pending",
+        )
+        .await;
+        assert_eq!(ack_b.to_header()?.tag()?.unwrap().value(), "tag-b");
+        peer.send_to(ok_a.as_bytes(), uac_addr).await?;
+        let (ack_a, _) = tokio::time::timeout(
+            Duration::from_millis(200),
+            next_request(
+                &peer,
+                Method::Ack,
+                "selected branch re-ACK while fork BYE is pending",
+            ),
+        )
+        .await
+        .expect("fork cleanup blocked the selected branch ACK");
+        assert_eq!(ack_a.to_header()?.tag()?.unwrap().value(), "tag-a");
+        // The forked callee answers the BYE like a real UA would.
+        reply_ok(&peer, &bye, from).await?;
+
+        // A retransmission of the forked 2xx (in flight before its ACK landed)
+        // must not trigger a second BYE.
+        peer.send_to(ok_b.as_bytes(), uac_addr).await?;
+        let mut buf = vec![0u8; 4096];
+        let quiet_until = tokio::time::Instant::now() + Duration::from_millis(400);
+        loop {
+            let remaining = quiet_until.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, peer.recv_from(&mut buf)).await {
+                Err(_) => break, // the quiet window elapsed: no duplicate BYE
+                Ok(Err(e)) => return Err(e.into()),
+                Ok(Ok((len, _))) => {
+                    if let Ok(SipMessage::Request(req)) = SipMessage::try_from(&buf[..len]) {
+                        assert_ne!(
+                            req.method,
+                            Method::Bye,
+                            "duplicate BYE for a retransmitted forked 2xx"
+                        );
+                    }
                 }
             }
         }
-    }
 
-    // The confirmed dialog is untouched: no new state notifications, no
-    // dialog registered for the forked branch, and the dialog still works.
-    assert!(
-        states.try_recv().is_err(),
-        "the forked 2xx must not touch the confirmed dialog's state"
-    );
-    let forked_id = DialogId {
-        call_id: confirmed.call_id.clone(),
-        local_tag: confirmed.local_tag.clone(),
-        remote_tag: "tag-b".to_string(),
-    };
-    assert!(
-        assert_layer.get_dialog(&forked_id).is_none(),
-        "the forked branch must not be registered as a dialog"
-    );
-    assert!(dialog.inner.state.lock().is_confirmed());
-
-    // The confirmed dialog is still usable: a BYE ends it normally.
-    let dialog2 = dialog.clone();
-    let bye_task = tokio::spawn(async move { dialog2.bye().await });
-    let (bye, _) = next_request(&peer, Method::Bye, "confirmed-dialog BYE").await;
-    assert!(
-        bye.to_header()?.value().to_string().contains(";tag=tag-a"),
-        "the confirmed dialog's BYE keeps tag-a: {}",
-        bye.to_header()?.value()
-    );
-    reply_ok(&peer, &bye, uac_addr).await?;
-    tokio::time::timeout(Duration::from_secs(3), bye_task)
+        // An invalid fork is a real cleanup failure, retained with its branch
+        // identity. It must not silently disappear or terminate the selected call.
+        let missing_contact = ok_b.replace("tag=tag-b", "tag=tag-c").replace(
+            &format!("Contact: <sip:bob-b@{}>\r\n", peer.local_addr()?),
+            "",
+        );
+        peer.send_to(missing_contact.as_bytes(), uac_addr).await?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !capture
+                    .lines(tracing::Level::WARN, "failed to BYE the forked branch")
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
         .await
-        .expect("timeout waiting for bye()")
-        .expect("bye task panicked")?;
-    assert!(dialog.inner.state.lock().is_terminated());
-    token.cancel();
+        .expect("cleanup failure was not reported");
+        let failures = capture.lines(tracing::Level::WARN, "failed to BYE the forked branch");
+        assert_eq!(failures.len(), 1);
+        assert!(
+            failures[0].contains("tag-c")
+                && failures[0].contains(&confirmed.call_id)
+                && failures[0].contains("missing Contact header"),
+            "{failures:?}"
+        );
+        peer.send_to(ok_a.as_bytes(), uac_addr).await?;
+        let (ack_a, _) = next_request(
+            &peer,
+            Method::Ack,
+            "selected branch ACK after cleanup failure",
+        )
+        .await;
+        assert_eq!(ack_a.to_header()?.tag()?.unwrap().value(), "tag-a");
+
+        // The confirmed dialog is untouched: no new state notifications, no
+        // dialog registered for the forked branch, and the dialog still works.
+        assert!(
+            states.try_recv().is_err(),
+            "the forked 2xx must not touch the confirmed dialog's state"
+        );
+        let forked_id = DialogId {
+            call_id: confirmed.call_id.clone(),
+            local_tag: confirmed.local_tag.clone(),
+            remote_tag: "tag-b".to_string(),
+        };
+        assert!(
+            assert_layer.get_dialog(&forked_id).is_none(),
+            "the forked branch must not be registered as a dialog"
+        );
+        assert!(dialog.inner.state.lock().is_confirmed());
+
+        // The confirmed dialog is still usable: a BYE ends it normally.
+        let dialog2 = dialog.clone();
+        let bye_task = tokio::spawn(async move { dialog2.bye().await });
+        let (bye, _) = next_request(&peer, Method::Bye, "confirmed-dialog BYE").await;
+        assert!(
+            bye.to_header()?.value().to_string().contains(";tag=tag-a"),
+            "the confirmed dialog's BYE keeps tag-a: {}",
+            bye.to_header()?.value()
+        );
+        reply_ok(&peer, &bye, uac_addr).await?;
+        tokio::time::timeout(Duration::from_secs(3), bye_task)
+            .await
+            .expect("timeout waiting for bye()")
+            .expect("bye task panicked")?;
+        assert!(dialog.inner.state.lock().is_terminated());
+        token.cancel();
+    }
     Ok(())
 }

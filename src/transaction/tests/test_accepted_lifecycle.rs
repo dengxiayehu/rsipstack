@@ -362,7 +362,7 @@ async fn test_do_invite_drainer_reacks_retransmitted_2xx() -> crate::Result<()> 
     let udp =
         UdpConnection::create_connection("127.0.0.1:0".parse()?, None, Some(token.child_token()))
             .await?;
-    let uac_addr = udp.get_addr().addr.clone();
+    let uac_addr = udp.get_addr().get_socketaddr()?;
     transport_layer.add_transport(udp.into());
     let endpoint = EndpointBuilder::new()
         .with_user_agent("rsipstack-test")
@@ -432,14 +432,26 @@ async fn test_do_invite_drainer_reacks_retransmitted_2xx() -> crate::Result<()> 
         resp.as_ref().map(|r| r.status_code.code()),
         Some(200)
     ));
-    peer.send_to(ok.as_bytes(), peer_addr).await?;
+    // Consume the first ACK before injecting a retransmission; otherwise it
+    // could falsely satisfy the re-ACK assertion below.
+    loop {
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .expect("initial ACK missing")?;
+        if buf[..len].starts_with(b"ACK ") {
+            break;
+        }
+    }
+    peer.send_to(ok.as_bytes(), uac_addr).await?;
 
     // The drainer must have re-ACKed the retransmission.
     loop {
         let Ok(Ok((len, _))) =
             tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf)).await
         else {
-            panic!("no re-ACK for the retransmitted 200 OK — did the do_invite drainer stop receiving?");
+            panic!(
+                "no re-ACK for the retransmitted 200 OK — did the do_invite drainer stop receiving?"
+            );
         };
         let text = String::from_utf8_lossy(&buf[..len]).to_string();
         if text.starts_with("BYE") {

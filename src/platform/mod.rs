@@ -44,6 +44,16 @@ pub mod tls;
 
 pub use select::{select2, select3, Either, Select2, Select3, Which3};
 
+// Async gates protect short wire submissions without blocking the executor.
+#[cfg(feature = "platform-tokio")]
+pub use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
+#[cfg(all(feature = "platform-embassy", not(feature = "platform-tokio")))]
+pub type AsyncMutex<T> = embassy_sync::mutex::Mutex<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, T>;
+#[cfg(all(feature = "platform-embassy", not(feature = "platform-tokio")))]
+pub type AsyncMutexGuard<'a, T> = embassy_sync::mutex::MutexGuard<
+    'a, embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, T>;
+
 // ── tokio backend ──
 #[cfg(feature = "platform-tokio")]
 pub type BoundedSender<T> = tokio::sync::mpsc::Sender<T>;
