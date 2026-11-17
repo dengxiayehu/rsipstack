@@ -124,6 +124,7 @@ pub struct EndpointInner {
     /// and INVITE CSeq number: `waiting_ack` holds only a dialog's latest
     /// INVITE, and the ACK of an earlier one can arrive after it (§13.2.2.4).
     pub(crate) waiting_ack_cseq: RwMap<(DialogId, u32), TransactionKey>,
+    pub(crate) dialog_layers: Mutex<Vec<alloc::sync::Weak<crate::dialog::dialog_layer::DialogLayerInner>>>,
     incoming_sender: TransactionSender,
     incoming_receiver: Mutex<Option<TransactionReceiver>>,
     cancel_token: CancellationToken,
@@ -246,6 +247,7 @@ impl EndpointInner {
             waiting_ack_cseq: RwMap::new(),
             timer_interval: timer_interval.unwrap_or(Duration::from_millis(20)),
             cancel_token,
+            dialog_layers: Mutex::new(Vec::new()),
             incoming_sender,
             incoming_receiver: Mutex::new(Some(incoming_receiver)),
             option: option.unwrap_or_default(),
@@ -525,9 +527,23 @@ impl EndpointInner {
             _ => {}
         }
 
-        let tx =
+        let mut tx =
             Transaction::new_server(key.clone(), request.clone(), self.clone(), Some(connection));
 
+        // Admit CSeq before the application can dispatch transactions concurrently.
+        // Only the short sequence check is ordered; application response work is not.
+        if DialogId::try_from(&tx).is_ok() {
+            let layers = {
+                let mut layers = self.dialog_layers.lock();
+                layers.retain(|layer| layer.strong_count() != 0);
+                layers.iter().filter_map(|layer| layer.upgrade()).collect::<Vec<_>>()
+            };
+            for layer in layers {
+                if layer.admit_request(&mut tx)? {
+                    break;
+                }
+            }
+        }
         self.incoming_sender.send(tx).ok();
         Ok(())
     }

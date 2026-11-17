@@ -434,6 +434,35 @@ pub struct DialogSnapshot {
     pub session_id: Option<SessionIdState>,
 }
 impl DialogInner {
+    /// Preserve the decision made in Endpoint arrival order across application dispatch.
+    pub(crate) fn admit_remote_cseq(self: &Arc<Self>, tx: &mut Transaction) -> Result<()> {
+        let (accepted, _) = self.check_remote_cseq(tx)?;
+        tx.remote_cseq_admission = Some((
+            Arc::downgrade(self), tx.original.cseq_header()?.seq()?, accepted,
+        ));
+        Ok(())
+    }
+
+    pub(super) fn check_remote_cseq(&self, tx: &Transaction) -> Result<(bool, u32)> {
+        let cseq = tx.original.cseq_header()?.seq()?;
+        if let Some((owner, admitted_seq, accepted)) = &tx.remote_cseq_admission {
+            if core::ptr::eq(owner.as_ptr(), self) && *admitted_seq == cseq {
+                return Ok((*accepted, self.remote_seq.load(Ordering::Relaxed)));
+            }
+        }
+        // Directly constructed transactions use the same monotonic rule. A failed
+        // CAS must retry rather than silently losing a concurrent sequence update.
+        let result = self.remote_seq.fetch_update(
+            Ordering::Relaxed, Ordering::Relaxed, |current| {
+                if current > 0 && cseq < current { None } else { Some(cseq) }
+            },
+        );
+        match result {
+            Ok(previous) => Ok((true, previous)),
+            Err(current) => Ok((false, current)),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         role: TransactionRole,

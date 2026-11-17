@@ -186,6 +186,9 @@ pub struct Transaction {
     retransmission: bool,
     // Calling may precede the first successful transport write.
     request_sent: bool,
+    pub(crate) remote_cseq_admission: Option<(
+        alloc::sync::Weak<crate::dialog::dialog::DialogInner>, u32, bool,
+    )>,
     is_cleaned_up: bool,
 }
 
@@ -225,6 +228,7 @@ impl Transaction {
             timer_g: None,
             retransmission: true,
             request_sent: false,
+            remote_cseq_admission: None,
             timer_l: None,
             timer_m: None,
             tu_receiver,

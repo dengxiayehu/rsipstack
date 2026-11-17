@@ -36,6 +36,17 @@ pub struct DialogLayerInner {
     pub(super) last_seq: AtomicU32,
     pub(super) dialogs: RwMap<String, Dialog>,
 }
+impl DialogLayerInner {
+    pub(crate) fn admit_request(&self, tx: &mut Transaction) -> Result<bool> {
+        let id = DialogId::try_from(&*tx)?;
+        if let Some(Dialog::Invite(dialog)) = self.dialogs.get(&id.to_string()) {
+            dialog.inner.admit_remote_cseq(tx)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+
 pub type DialogLayerInnerRef = Arc<DialogLayerInner>;
 
 /// SIP Dialog Layer
@@ -136,13 +147,16 @@ pub struct DialogLayer {
 
 impl DialogLayer {
     pub fn new(endpoint: EndpointInnerRef) -> Self {
-        Self {
-            endpoint,
-            inner: Arc::new(DialogLayerInner {
-                last_seq: AtomicU32::new(0),
-                dialogs: RwMap::new(),
-            }),
+        let inner = Arc::new(DialogLayerInner {
+            last_seq: AtomicU32::new(0),
+            dialogs: RwMap::new(),
+        });
+        {
+            let mut layers = endpoint.dialog_layers.lock();
+            layers.retain(|layer| layer.strong_count() != 0);
+            layers.push(Arc::downgrade(&inner));
         }
+        Self { endpoint, inner }
     }
 
     pub fn get_or_create_server_invite(

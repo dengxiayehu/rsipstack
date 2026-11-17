@@ -84,6 +84,13 @@ fn drain_states(rx: &mut DialogStateReceiver) -> Vec<DialogState> {
 async fn establish(
     token: &CancellationToken,
 ) -> crate::Result<(InviteDialog, DialogStateReceiver, UdpSocket)> {
+    establish_with_dispatch(token, None).await
+}
+
+async fn establish_with_dispatch(
+    token: &CancellationToken,
+    dispatch: Option<tokio::sync::mpsc::UnboundedSender<crate::transaction::transaction::Transaction>>,
+) -> crate::Result<(InviteDialog, DialogStateReceiver, UdpSocket)> {
     let peer = UdpSocket::bind("127.0.0.1:0").await?;
     let peer_port = peer.local_addr()?.port();
 
@@ -115,6 +122,10 @@ async fn establish(
     };
     tokio::spawn(async move {
         while let Some(mut tx) = incoming.recv().await {
+            if let Some(dispatch) = &dispatch {
+                dispatch.send(tx).unwrap();
+                continue;
+            }
             if let Some(mut dialog) = pump_layer.match_dialog(&tx) {
                 tokio::spawn(async move {
                     let _ = dialog.handle(&mut tx).await;
@@ -298,5 +309,63 @@ async fn test_provisional_after_terminated_is_not_notified() -> crate::Result<()
 
     assert!(dialog.state().is_terminated());
     token.cancel();
+    Ok(())
+}
+
+/// Endpoint arrival order must survive a consumer scheduling INFO before BYE.
+#[tokio::test]
+async fn test_incoming_cseq_admission_precedes_consumer_dispatch() -> crate::Result<()> {
+    for stale_bye in [false, true] {
+        let token = CancellationToken::new();
+        let _guard = token.clone().drop_guard();
+        let (dispatch, mut incoming) = unbounded_channel();
+        let (dialog, mut states, peer) = establish_with_dispatch(&token, Some(dispatch)).await?;
+        let id = dialog.id();
+        let local = dialog.inner.endpoint_inner.get_addrs()[0].get_socketaddr()?;
+        let addr = peer.local_addr()?;
+        let request = |method: Method, seq: u32| format!(
+            "{method} sip:alice@{local} SIP/2.0\r\n\
+             Via: SIP/2.0/UDP {addr};branch=z9hG4bK-receive-{seq}-{method}\r\n\
+             From: <sip:bob@{addr}>;tag={remote}\r\n\
+             To: <sip:alice@{local}>;tag={local_tag}\r\n\
+             Call-ID: {call_id}\r\nCSeq: {seq} {method}\r\n\
+             Max-Forwards: 70\r\nContent-Length: 0\r\n\r\n",
+            remote = id.remote_tag, local_tag = id.local_tag, call_id = id.call_id,
+        );
+        let receive = async |incoming: &mut tokio::sync::mpsc::UnboundedReceiver<crate::transaction::transaction::Transaction>| {
+            tokio::time::timeout(Duration::from_secs(2), incoming.recv()).await.unwrap().unwrap()
+        };
+        // Receiving each Transaction is the barrier proving Endpoint arrival order.
+        let (mut bye, mut info) = if stale_bye {
+            peer.send_to(request(Method::Info, 1606).as_bytes(), local).await?;
+            let info = receive(&mut incoming).await;
+            peer.send_to(request(Method::Bye, 1605).as_bytes(), local).await?;
+            (receive(&mut incoming).await, info)
+        } else {
+            peer.send_to(request(Method::Bye, 1605).as_bytes(), local).await?;
+            let bye = receive(&mut incoming).await;
+            peer.send_to(request(Method::Info, 1606).as_bytes(), local).await?;
+            (bye, receive(&mut incoming).await)
+        };
+        let mut info_dialog = dialog.clone();
+        let mut info_task = Box::pin(info_dialog.handle(&mut info));
+        assert!(futures::poll!(info_task.as_mut()).is_pending());
+        assert!(matches!(states.recv().await, Some(DialogState::Info(..))));
+        let mut bye_dialog = dialog.clone();
+        bye_dialog.handle(&mut bye).await?;
+        let mut buf = [0u8; 4096];
+        let response = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (len, _) = peer.recv_from(&mut buf).await.unwrap();
+                if let Ok(SipMessage::Response(resp)) = SipMessage::try_from(&buf[..len]) {
+                    if resp.cseq_header().unwrap().seq().unwrap() == 1605 { break resp; }
+                }
+            }
+        }).await.unwrap();
+        assert_eq!(response.status_code, if stale_bye {
+            crate::sip::StatusCode::ServerInternalError
+        } else { crate::sip::StatusCode::OK }, "earlier BYE must not become stale due to consumer scheduling");
+        assert_eq!(dialog.state().is_terminated(), !stale_bye);
+    }
     Ok(())
 }

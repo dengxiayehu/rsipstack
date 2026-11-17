@@ -8,7 +8,6 @@ use crate::{
     transaction::transaction::{Transaction, TransactionEvent},
     Result,
 };
-use core::sync::atomic::Ordering;
 use tracing::{debug, trace, warn};
 
 /// Server-side INVITE Dialog (UAS)
@@ -648,8 +647,8 @@ impl ServerInviteDialog {
         );
 
         let cseq = tx.original.cseq_header()?.seq()?;
-        let remote_seq = self.inner.remote_seq.load(Ordering::Relaxed);
-        if remote_seq > 0 && cseq < remote_seq {
+        let (accepted, remote_seq) = self.inner.check_remote_cseq(tx)?;
+        if !accepted {
             debug!(
                 id = %self.id(),
                 method = %tx.original.method(),
@@ -660,10 +659,6 @@ impl ServerInviteDialog {
             // discard old request
             return Ok(());
         }
-        self.inner
-            .remote_seq
-            .compare_exchange(remote_seq, cseq, Ordering::Relaxed, Ordering::Relaxed)
-            .ok();
 
         if self.inner.is_confirmed() {
             match tx.original.method {
