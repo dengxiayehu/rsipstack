@@ -89,6 +89,12 @@ impl InviteDialog {
         self.inner.remote_ack.lock().clone()
     }
 
+    /// The received BYE that terminated this dialog and its transport source,
+    /// available when `Terminated` is delivered. Local hangup returns `None`.
+    pub fn remote_termination_request(&self) -> Option<(Request, Option<crate::transport::SipAddr>)> {
+        self.inner.remote_termination_request.lock().as_deref().cloned()
+    }
+
     /// The initial INVITE request that created this dialog.
     pub fn initial_request(&self) -> Request {
         self.inner.initial_request.lock().clone()
@@ -908,8 +914,7 @@ impl InviteDialog {
             TransactionRole::Server => TerminatedReason::UacBye,
             TransactionRole::Client => TerminatedReason::UasBye,
         };
-        self.inner
-            .transition(DialogState::Terminated(self.id(), reason));
+        self.inner.terminate_from_remote_bye(self.id(), reason, tx);
         tx.reply(StatusCode::OK).await?;
         Ok(())
     }

@@ -335,6 +335,7 @@ pub struct DialogInner {
     /// The last ACK received for an INVITE or re-INVITE this dialog answered
     /// (UAS role). Carries the answer when the 2xx carried the offer.
     pub(super) remote_ack: Mutex<Option<Request>>,
+    pub(super) remote_termination_request: Mutex<Option<Box<(Request, Option<SipAddr>)>>>,
     pub(super) server_connection: Mutex<Option<SipConnection>>,
     /// Structural source address of the flow that created this server dialog,
     /// captured at creation time from the connection itself (not parsed from
@@ -535,6 +536,7 @@ impl DialogInner {
             supports_100rel,
             remote_reliable: Mutex::new(None),
             remote_ack: Mutex::new(None),
+            remote_termination_request: Mutex::new(None),
             server_connection: Mutex::new(None),
             dialback_target: Mutex::new(None),
             cancel_requested: AtomicBool::new(false),
@@ -1669,6 +1671,7 @@ impl DialogInner {
             supports_100rel: snapshot.supports_100rel,
             remote_reliable: Mutex::new(None),
             remote_ack: Mutex::new(None),
+            remote_termination_request: Mutex::new(None),
             server_connection: Mutex::new(None),
             dialback_target: Mutex::new(None),
             cancel_requested: AtomicBool::new(false),
@@ -1752,6 +1755,16 @@ impl DialogInner {
         // applied, while still holding it, so notifications follow the order
         // in which the state changed.
         self.transition_locked(&mut self.state.lock(), state);
+    }
+
+    pub(super) fn terminate_from_remote_bye(&self, id: DialogId, reason: TerminatedReason, tx: &Transaction) {
+        let mut state = self.state.lock();
+        if state.is_terminated() {
+            return;
+        }
+        let source = tx.connection.as_ref().and_then(SipConnection::get_remote_addr).cloned();
+        *self.remote_termination_request.lock() = Some(Box::new((tx.original.clone(), source)));
+        self.transition_locked(&mut state, DialogState::Terminated(id, reason));
     }
 
     /// `handle()` announcing an initial INVITE: re-enters `Calling` only while

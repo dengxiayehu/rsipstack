@@ -1,6 +1,6 @@
 [package]
 name = "fork-rsipstack"
-version = "0.7.15"
+version = "0.7.16-rc.1"
 edition = "2021"
 description = "rsipstack 0.7.14 fork with ordered dialog sends and nonblocking fork cleanup"
 license = "MIT"

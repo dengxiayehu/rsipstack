@@ -728,8 +728,7 @@ impl ServerInviteDialog {
 
     async fn handle_bye(&mut self, tx: &mut Transaction) -> Result<()> {
         debug!(id = %self.id(), uri = %tx.original.uri, "received bye");
-        self.inner
-            .transition(DialogState::Terminated(self.id(), TerminatedReason::UacBye));
+        self.inner.terminate_from_remote_bye(self.id(), TerminatedReason::UacBye, tx);
         tx.reply(crate::sip::StatusCode::OK).await?;
         Ok(())
     }
